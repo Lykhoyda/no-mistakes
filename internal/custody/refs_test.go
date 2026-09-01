@@ -24,6 +24,77 @@ func TestPreserveRecoveryHeadCreatesAnchorAndAcceptsSameCommit(t *testing.T) {
 	}
 }
 
+func TestInspectRecoveryHead(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		configure  func(t *testing.T, repo, ref, head string)
+		wantState  RecoveryHeadState
+		wantTarget func(head, other, blob string) string
+	}{
+		{name: "absent", wantState: RecoveryHeadAbsent},
+		{
+			name:       "exact commit",
+			configure:  func(t *testing.T, repo, ref, head string) { gitRun(t, repo, "update-ref", ref, head) },
+			wantState:  RecoveryHeadExact,
+			wantTarget: func(head, _, _ string) string { return head },
+		},
+		{
+			name:       "symbolic",
+			configure:  func(t *testing.T, repo, ref, _ string) { gitRun(t, repo, "symbolic-ref", ref, "refs/heads/main") },
+			wantState:  RecoveryHeadSymbolic,
+			wantTarget: func(_, _, _ string) string { return "refs/heads/main" },
+		},
+		{
+			name: "non commit",
+			configure: func(t *testing.T, repo, ref, _ string) {
+				blobPath := filepath.Join(repo, "inspection-blob.txt")
+				if err := os.WriteFile(blobPath, []byte("evidence\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				gitRun(t, repo, "update-ref", ref, gitOutput(t, repo, "hash-object", "-w", blobPath))
+			},
+			wantState:  RecoveryHeadNonCommit,
+			wantTarget: func(_, _, blob string) string { return blob },
+		},
+		{
+			name: "mismatched commit",
+			configure: func(t *testing.T, repo, ref, _ string) {
+				gitRun(t, repo, "commit", "--allow-empty", "-m", "other")
+				gitRun(t, repo, "update-ref", ref, gitOutput(t, repo, "rev-parse", "HEAD"))
+			},
+			wantState:  RecoveryHeadMismatched,
+			wantTarget: func(_, other, _ string) string { return other },
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, head := recoveryTestRepo(t)
+			ref := RecoveryRef("run-1")
+			if tt.configure != nil {
+				tt.configure(t, repo, ref, head)
+			}
+			other := gitOutput(t, repo, "rev-parse", "HEAD")
+			blob := ""
+			if tt.wantState == RecoveryHeadNonCommit {
+				blob = gitOutput(t, repo, "rev-parse", ref)
+			}
+			got, err := InspectRecoveryHead(context.Background(), repo, "run-1", head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != tt.wantState {
+				t.Fatalf("state = %q, want %q", got.State, tt.wantState)
+			}
+			wantTarget := ""
+			if tt.wantTarget != nil {
+				wantTarget = tt.wantTarget(head, other, blob)
+			}
+			if got.Target != wantTarget {
+				t.Fatalf("target = %q, want %q", got.Target, wantTarget)
+			}
+		})
+	}
+}
+
 func TestPreserveRecoveryHeadRejectsConflictingAnchorWithoutOverwriting(t *testing.T) {
 	repo, head := recoveryTestRepo(t)
 	gitRun(t, repo, "commit", "--allow-empty", "-m", "other")

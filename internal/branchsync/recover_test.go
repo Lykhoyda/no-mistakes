@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	gitpkg "github.com/kunchenguid/no-mistakes/internal/git"
@@ -22,6 +23,10 @@ type cancellationRaceStep struct {
 }
 
 type unreachedCancellationStep struct{}
+
+type reviewLaunchFailureStep struct{}
+
+type launchFailureAgent struct{}
 
 type skippedDeliveryStep struct {
 	name types.StepName
@@ -38,6 +43,21 @@ func (*unreachedCancellationStep) Name() types.StepName { return types.StepRevie
 func (*unreachedCancellationStep) Execute(*pipelinepkg.StepContext) (*pipelinepkg.StepOutcome, error) {
 	return &pipelinepkg.StepOutcome{}, nil
 }
+
+func (*reviewLaunchFailureStep) Name() types.StepName { return types.StepReview }
+
+func (*reviewLaunchFailureStep) Execute(sctx *pipelinepkg.StepContext) (*pipelinepkg.StepOutcome, error) {
+	_, err := sctx.RunAgent(agent.RunOpts{Prompt: "review", CWD: sctx.WorkDir})
+	return nil, err
+}
+
+func (*launchFailureAgent) Name() string { return "launch-failure" }
+
+func (*launchFailureAgent) Run(context.Context, agent.RunOpts) (*agent.Result, error) {
+	return nil, errors.New("claude start: context deadline exceeded")
+}
+
+func (*launchFailureAgent) Close() error { return nil }
 
 func (s *cancellationRaceStep) Name() types.StepName { return types.StepReview }
 
@@ -432,8 +452,8 @@ func TestRecoverDivergedRefusesButKeepLocalReturnsCustody(t *testing.T) {
 	mustRun(t, f.local, "commit", "-m", "diverging rescope")
 	divergedHead := mustRun(t, f.local, "rev-parse", "HEAD")
 	inspected := f.service.InspectCached(f.ctx)
-	if inspected.NextAction == nil || inspected.NextAction.Code == "recover_custody" {
-		t.Fatalf("uncontained divergence advertised recovery = %#v", inspected)
+	if inspected.NextAction == nil || inspected.NextAction.Code != "recover_custody" || inspected.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+		t.Fatalf("uncontained divergence did not advertise guarded keep-local recovery = %#v", inspected)
 	}
 
 	refused := f.service.Recover(f.ctx, false)
@@ -990,6 +1010,95 @@ func TestCancellationReleaseRequiresVerifiedManagedHead(t *testing.T) {
 			state := f.service.InspectCached(f.ctx)
 			if state.State != tt.wantState || state.Safety != tt.wantSafety {
 				t.Fatalf("state = %#v, want %s/%s", state, tt.wantState, tt.wantSafety)
+			}
+		})
+	}
+}
+
+func TestReviewLaunchFailurePublishesOnlyObservedHeadsAndKeepsCustodyRecoverable(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		fixture       func(*testing.T, types.RunStatus) *recoverFixture
+		wantAnchor    custody.RecoveryHeadState
+		wantKeepLocal bool
+	}{
+		{
+			name:       "pre-commit failure releases unchanged submitted head",
+			fixture:    newUnmovedRecoverFixture,
+			wantAnchor: custody.RecoveryHeadAbsent,
+		},
+		{
+			name:          "post-commit rereview failure offers guarded keep-local recovery",
+			fixture:       newRecoverFixture,
+			wantAnchor:    custody.RecoveryHeadExact,
+			wantKeepLocal: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := tt.fixture(t, types.RunFailed)
+			if err := f.db.UpdateRunStatus(f.run.ID, types.RunPending); err != nil {
+				t.Fatal(err)
+			}
+			f.run.Status = types.RunPending
+			f.run.TerminalHeadVerifiedAt = nil
+
+			managed := filepath.Join(t.TempDir(), "managed")
+			if err := gitpkg.WorktreeAdd(f.ctx, f.gate, managed, f.preserved); err != nil {
+				t.Fatal(err)
+			}
+			p := paths.WithRoot(t.TempDir())
+			if err := p.EnsureDirs(); err != nil {
+				t.Fatal(err)
+			}
+			executor := pipelinepkg.NewExecutor(f.db, p, nil, &launchFailureAgent{}, []pipelinepkg.Step{&reviewLaunchFailureStep{}}, nil)
+			if err := executor.Execute(context.Background(), f.run, f.repo, managed); err == nil || !strings.Contains(err.Error(), "claude start") {
+				t.Fatalf("review launch error = %v", err)
+			}
+
+			terminal, err := f.db.GetRun(f.run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if terminal.Status != types.RunFailed || terminal.HeadSHA != f.preserved || terminal.TerminalHeadVerifiedAt == nil {
+				t.Fatalf("terminal run = status %s head %s verified %#v", terminal.Status, terminal.HeadSHA, terminal.TerminalHeadVerifiedAt)
+			}
+			inspection, err := custody.InspectRecoveryHead(f.ctx, f.gate, f.run.ID, f.preserved)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inspection.State != tt.wantAnchor {
+				t.Fatalf("recovery head = %#v, want %s", inspection, tt.wantAnchor)
+			}
+
+			if !tt.wantKeepLocal {
+				state := f.service.InspectCached(f.ctx)
+				if state.State != StateUserOwned || state.Local.Head != f.submitted || state.Pipeline.CurrentHead != f.submitted || state.NextAction != nil {
+					t.Fatalf("pre-commit launch failure custody = %#v", state)
+				}
+				return
+			}
+
+			mustWrite(t, filepath.Join(f.local, "rescope.txt"), "rescope\n")
+			mustRun(t, f.local, "add", "rescope.txt")
+			mustRun(t, f.local, "commit", "-m", "diverging rescope")
+			keptHead := mustRun(t, f.local, "rev-parse", "HEAD")
+			mustRun(t, f.local, "fetch", f.gate, f.anchorRef()+":refs/no-mistakes/test/preserved")
+			state := f.service.InspectCached(f.ctx)
+			if state.Relation != RelationDiverged || state.NextAction == nil || state.NextAction.Code != "recover_custody" || state.NextAction.Command != "no-mistakes axi sync --recover --keep-local" {
+				t.Fatalf("post-commit launch failure custody = %#v", state)
+			}
+			recovered := f.service.Recover(f.ctx, true)
+			if !recovered.Recovered || recovered.Changed || !f.custodyReturned() {
+				t.Fatalf("keep-local recovery = %#v", recovered)
+			}
+			if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != keptHead {
+				t.Fatalf("local head = %s, want kept %s", got, keptHead)
+			}
+			if got := mustRun(t, f.local, "rev-parse", f.anchorRef()); got != f.preserved {
+				t.Fatalf("preserved head = %s, want %s", got, f.preserved)
+			}
+			if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != keptHead {
+				t.Fatalf("gate branch = %s, want kept %s", got, keptHead)
 			}
 		})
 	}
